@@ -1,0 +1,326 @@
+---
+title: "Deseq_plots_analysis"
+output: html_document
+date: "2025-12-10"
+---
+
+```{r}
+wd <- "C:/Users/youssrasemlali/Desktop/Coursework Files from HPC"
+setwd(wd)
+cat("Working directory:\n  ", getwd(), "\n\n")
+
+# Create output folders
+if (!dir.exists("results_deseq2")) dir.create("results_deseq2")
+if (!dir.exists("plots")) dir.create("plots")
+```
+
+# ------------------------------------------------------------
+# 1. Load packages
+# ------------------------------------------------------------
+
+```{r}
+cat("Loading packages...\n")
+
+needed_pkgs <- c("DESeq2", "ggplot2", "pheatmap", "RColorBrewer")
+for (pkg in needed_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Package '", pkg, "' is not installed. Please install it first.\n")
+  } else {
+    library(pkg, character.only = TRUE)
+  }
+}
+
+cat("Packages loaded successfully.\n\n")
+```
+
+# ------------------------------------------------------------
+# 2. Load counts + sample_info (same directory)
+# ------------------------------------------------------------
+
+```{r}
+cat("Loading cleaned counts matrix...\n")
+if (!file.exists("gene_counts_cleaned.rds")) {
+  stop("gene_counts_cleaned.rds not found in working directory.\n")
+}
+counts <- readRDS("gene_counts_cleaned.rds")
+
+cat("Counts dimensions (genes x samples): ",
+    paste(dim(counts), collapse = " x "), "\n\n")
+
+cat("Loading sample_info.csv...\n")
+if (!file.exists("sample_info.csv")) {
+  stop("sample_info.csv not found in working directory.\n")
+}
+sample_info <- read.csv("sample_info.csv", stringsAsFactors = FALSE)
+
+cat("sample_info rows x cols: ",
+    paste(dim(sample_info), collapse = " x "), "\n\n")
+
+cat("First few rows of sample_info:\n")
+print(head(sample_info))
+cat("\n")
+```
+
+# ------------------------------------------------------------
+# 3. Align counts with metadata
+# ------------------------------------------------------------
+
+```{r}
+cat("Aligning counts with sample_info...\n")
+
+if (!"sample_id" %in% colnames(sample_info)) {
+  stop("sample_info must contain a column named 'sample_id'.\n")
+}
+
+common_samples <- intersect(colnames(counts), sample_info$sample_id)
+
+if (length(common_samples) == 0) {
+  stop("No overlapping sample IDs between counts and sample_info.\n")
+}
+
+sample_info <- sample_info[match(common_samples, sample_info$sample_id), ]
+counts <- counts[, common_samples]
+
+if (!all(colnames(counts) == sample_info$sample_id)) {
+  stop("Column order mismatch between counts and sample_info after subsetting.\n")
+}
+
+cat("Samples used in analysis (", length(common_samples), "):\n  ",
+    paste(common_samples, collapse = ", "), "\n\n")
+```
+
+# ------------------------------------------------------------
+# 4. Filter low-count genes
+# ------------------------------------------------------------
+
+```{r}
+cat("Filtering out genes with zero total counts...\n")
+keep_genes <- rowSums(counts) > 0
+counts_filt <- counts[keep_genes, ]
+
+cat("Genes kept: ", sum(keep_genes),
+    " out of ", nrow(counts), "\n\n")
+```
+
+# ------------------------------------------------------------
+# 5. Construct DESeq2 dataset
+# ------------------------------------------------------------
+
+```{r}
+cat("Constructing DESeqDataSet with design = ~ group ...\n")
+
+if (!"group" %in% colnames(sample_info)) {
+  stop("sample_info must contain a column named 'group'.\n")
+}
+
+sample_info$group <- factor(sample_info$group)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_filt,
+  colData   = sample_info,
+  design    = ~ group
+)
+
+cat("DESeqDataSet constructed. Running DESeq()...\n\n")
+
+dds <- DESeq(dds)
+
+cat("DESeq2 model fitting complete.\n\n")
+
+saveRDS(dds, file = "results_deseq2/dds.rds")
+cat("Saved DESeqDataSet to results_deseq2/dds.rds\n\n")
+
+```
+
+# ------------------------------------------------------------
+# 6. Extract results for each contrast
+# ------------------------------------------------------------
+
+```{r}
+cat("Extracting DESeq2 results for F, Sz, Mz (Evolved vs Producer)...\n")
+
+res_list <- list(
+  Sz = results(dds, contrast = c("group", "Evolved_Sz", "Producer_Sz")),
+  F  = results(dds, contrast = c("group", "Evolved_F", "Producer_F")),
+  Mz = results(dds, contrast = c("group", "Evolved_Mz", "Producer_Mz"))
+)
+
+for (cond in names(res_list)) {
+  res_df <- as.data.frame(res_list[[cond]])
+  out_file <- file.path("results_deseq2",
+                        paste0("DESeq2_results_", cond, ".csv"))
+  write.csv(res_df, out_file)
+  cat("  Saved results for ", cond, " to: ", out_file, "\n", sep = "")
+}
+cat("\n")
+```
+
+# ------------------------------------------------------------
+# 7. VST + PCA (Script 1 EV4C implementation)
+# ------------------------------------------------------------
+
+```{r}
+cat("Performing variance stabilising transformation (vst) for downstream analyses...\n")
+vsd <- vst(dds, blind = FALSE)
+saveRDS(vsd, file = "results_deseq2/vsd.rds")
+cat("Saved VST object to results_deseq2/vsd.rds\n\n")
+
+cat("═══════════════════════════════════════════════════════════════\n")
+cat(" Figure EV4C Reproduction - Transcriptomics PCA (Script 1)\n")
+cat("═══════════════════════════════════════════════════════════════\n\n")
+```
+
+```{r}
+# ----- Recreate Script 1 metadata columns (using existing sample_info) -----
+
+# Product column for colouring (WT, Producer_F, Producer_Sz, Producer_Mz)
+sample_info$product <- ifelse(sample_info$strain == "WT", "WT",
+                              paste0("Producer_", sample_info$condition))
+
+# Rename "Producer" to "Parental" for shape legend (paper terminology)
+sample_info$strain_label <- ifelse(
+  sample_info$strain == "Producer", "Parental",
+  ifelse(sample_info$strain == "Evolved", "Evolved", "WT")
+)
+
+# Factor levels as in Script 1
+sample_info$product <- factor(
+  sample_info$product,
+  levels = c("WT", "Producer_F", "Producer_Sz", "Producer_Mz")
+)
+sample_info$strain_label <- factor(
+  sample_info$strain_label,
+  levels = c("WT", "Parental", "Evolved")
+)
+
+# Safety check before PCA
+if (!all(colnames(counts_filt) == sample_info$sample_id)) {
+  stop("Mismatch between counts_filt columns and sample_info$sample_id before PCA.\n")
+}
+
+cat("Final dataset for PCA: ",
+    ncol(counts_filt), " samples, ",
+    nrow(counts_filt), " genes\n\n", sep = "")
+
+# ----- Script 1: DESeqDataSet + VST (blind) + manual PCA -----
+
+cat("Running VST transformation for PCA (blind = TRUE)...\n")
+
+dds_pca <- DESeqDataSetFromMatrix(
+  countData = counts_filt,
+  colData   = sample_info,
+  design    = ~ 1
+)
+
+vsd_pca <- vst(dds_pca, blind = TRUE)
+
+cat("Computing PCA (top 500 variable genes)...\n")
+rv <- rowVars(assay(vsd_pca))
+ntop <- min(500, length(rv))
+select <- order(rv, decreasing = TRUE)[1:ntop]
+mat <- t(assay(vsd_pca)[select, ])
+
+pca <- prcomp(mat, center = TRUE, scale. = FALSE)
+percentVar <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+
+cat("  PC1:", percentVar[1], "% variance\n")
+cat("  PC2:", percentVar[2], "% variance\n\n")
+
+# Flip PC2 to match paper orientation
+pca_df <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = -pca$x[, 2],
+  sample_id    = rownames(pca$x),
+  product      = sample_info$product,
+  strain_label = sample_info$strain_label
+)
+
+cat("Creating Figure EV4C plot...\n")
+
+# Paper colors
+product_colors <- c(
+  "WT"           = "#000000",
+  "Producer_F"   = "#E69F00",
+  "Producer_Sz"  = "#56B4E9",
+  "Producer_Mz"  = "#009E73"
+)
+
+# Shapes: WT = filled square (22), Parental = triangle (24), Evolved = circle (21)
+strain_shapes <- c(
+  "WT"       = 22,
+  "Parental" = 24,
+  "Evolved"  = 21
+)
+
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2)) +
+  # Reference lines
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.4) +
+  geom_vline(xintercept = 0, color = "grey70", linewidth = 0.4) +
+  # Points with fill colour and black outline
+  geom_point(aes(fill = product, shape = strain_label),
+             size = 4, color = "black", stroke = 0.5) +
+  # Fill colors (inside of shapes)
+  scale_fill_manual(
+    name = NULL,
+    values = product_colors,
+    guide = guide_legend(
+      order = 1, nrow = 1,
+      override.aes = list(shape = 22, size = 4, stroke = 0.5)
+    )
+  ) +
+  # Shapes - WT is excluded from shape legend via breaks
+  scale_shape_manual(
+    name = NULL,
+    values = strain_shapes,
+    breaks = c("Parental", "Evolved"),
+    guide = guide_legend(
+      order = 2, nrow = 1,
+      override.aes = list(fill = NA, size = 3, stroke = 0.5)
+    )
+  ) +
+  # Labels
+  labs(
+    x = paste0("PC1: ", percentVar[1], "% variance"),
+    y = paste0("PC2: ", percentVar[2], "% variance"),
+    title = "Transcriptomics"
+  ) +
+  # Theme matching paper
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 1, fill = NA),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 10, color = "black"),
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.box = "vertical",
+    legend.box.just = "left",
+    legend.spacing.y = grid::unit(0.1, "cm"),
+    legend.margin = margin(t = 5, b = 5),
+    legend.text = element_text(size = 9),
+    legend.title = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", hjust = 0),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+ggsave("plots/Figure_EV4C_transcriptomics.png", p_pca,
+       width = 6.5, height = 6, dpi = 300, bg = "white")
+```
+
+```{r}
+cat("\n═══════════════════════════════════════════════════════════════\n")
+cat(" Output saved: plots/Figure_EV4C_transcriptomics.png\n")
+cat("═══════════════════════════════════════════════════════════════\n\n")
+
+n_prod_evol <- sum(sample_info$strain != "WT")
+n_wt        <- sum(sample_info$strain == "WT")
+
+cat("Summary:\n")
+cat("  PC1:", percentVar[1], "% (Paper: 49%)\n")
+cat("  PC2:", percentVar[2], "% (Paper: 26%)\n")
+cat("  Samples: ", ncol(counts_filt), " (",
+    n_prod_evol, " Producer/Evolved + ",
+    n_wt, " WT)\n", sep = "")
+cat("  Genes used: ", ntop, " most variable\n\n", sep = "")
+```
+
